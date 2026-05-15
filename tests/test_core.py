@@ -565,6 +565,112 @@ class TestSmartDownsample:
         assert indices1 == indices2
 
 
+class TestMultiModelInfrastructure:
+    """Tests for multi-model embedding infrastructure."""
+
+    def test_embedding_dims_dict_exists(self):
+        import smartdownsample.core as core
+        assert hasattr(core, 'EMBEDDING_DIMS')
+        assert core.EMBEDDING_DIMS['dinov2'] == 384
+        assert core.EMBEDDING_DIMS['speciesnet'] == 1280
+        assert core.EMBEDDING_DIMS['titok_backbone'] == 2048
+        assert core.EMBEDDING_DIMS['titok_full'] == 4096
+
+    def test_embedding_dim_constant_removed(self):
+        import smartdownsample.core as core
+        assert not hasattr(core, 'EMBEDDING_DIM'), \
+            "EMBEDDING_DIM constant should be removed in favour of EMBEDDING_DIMS dict"
+
+    def test_gemini_encoder_forward_shape(self):
+        import torch
+        from smartdownsample.core import _GeminiV0Encoder
+        model = _GeminiV0Encoder()
+        model.eval()
+        with torch.no_grad():
+            # full forward: (B, 4096, 128)
+            out = model(torch.randn(2, 3, 256, 256))
+        assert out.shape == (2, 4096, 128), f"Expected (2, 4096, 128), got {out.shape}"
+
+    def test_gemini_encoder_backbone_shape(self):
+        import torch
+        from smartdownsample.core import _GeminiV0Encoder
+        model = _GeminiV0Encoder()
+        model.eval()
+        with torch.no_grad():
+            # backbone only: (B, 2048, 8, 8)
+            out = model.backbone(torch.randn(2, 3, 256, 256))
+        assert out.shape == (2, 2048, 8, 8), f"Expected (2, 2048, 8, 8), got {out.shape}"
+
+    def test_get_model_invalid_version_raises(self):
+        from smartdownsample.core import _get_model
+        with pytest.raises(ValueError, match="model_version must be one of"):
+            _get_model(model_version='invalid')
+
+    def test_get_model_speciesnet_missing_weights_raises(self):
+        from smartdownsample.core import _get_model
+        with pytest.raises(ValueError, match="SpeciesNet weights not found"):
+            _get_model(model_version='speciesnet',
+                       speciesnet_weights='/nonexistent/path/weights.pt')
+
+    def test_get_model_titok_missing_weights_raises(self):
+        from smartdownsample.core import _get_model
+        with pytest.raises(ValueError, match="TiTok weights not found"):
+            _get_model(model_version='titok',
+                       titok_weights='/nonexistent/path/weights.pt')
+
+    def test_compute_embeddings_titok_backbone_pooling(self):
+        """Verify backbone pooling produces correct shape without loading weights."""
+        import torch
+        import numpy as np
+        from smartdownsample.core import _GeminiV0Encoder, EMBEDDING_DIMS
+
+        # Simulate what _compute_embeddings does for titok_backbone
+        model = _GeminiV0Encoder().eval()
+        batch = torch.randn(3, 3, 256, 256)
+        with torch.no_grad():
+            features = model.backbone(batch)              # (3, 2048, 8, 8)
+            features = features.reshape(features.size(0), features.size(1), -1).mean(dim=-1)  # (3, 2048)
+        assert features.shape == (3, EMBEDDING_DIMS['titok_backbone'])
+
+    def test_compute_embeddings_titok_full_pooling(self):
+        """Verify full encoder pooling produces correct shape without loading weights."""
+        import torch
+        from smartdownsample.core import _GeminiV0Encoder, EMBEDDING_DIMS
+
+        model = _GeminiV0Encoder().eval()
+        batch = torch.randn(3, 3, 256, 256)
+        with torch.no_grad():
+            features = model(batch).mean(dim=-1)          # (3, 4096)
+        assert features.shape == (3, EMBEDDING_DIMS['titok_full'])
+
+    def test_sample_diverse_invalid_model_version(self, tmp_path):
+        """Invalid model_version raises ValueError."""
+        from PIL import Image as _Image
+        import numpy as _np
+        img = _Image.fromarray(_np.random.randint(0, 255, (100, 100, 3), dtype=_np.uint8))
+        p = tmp_path / "img.jpg"
+        img.save(p)
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="model_version must be one of"):
+            from smartdownsample import sample_diverse
+            sample_diverse([str(p)]*5, target_count=2,
+                           model_version='invalid', show_progress=False)
+
+    def test_sample_diverse_invalid_titok_layer(self, tmp_path):
+        """Invalid titok_layer raises ValueError."""
+        from PIL import Image as _Image
+        import numpy as _np
+        img = _Image.fromarray(_np.random.randint(0, 255, (100, 100, 3), dtype=_np.uint8))
+        p = tmp_path / "img.jpg"
+        img.save(p)
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="titok_layer must be 'backbone' or 'full'"):
+            from smartdownsample import sample_diverse
+            sample_diverse([str(p)]*5, target_count=2,
+                           model_version='titok', titok_layer='invalid',
+                           show_progress=False)
+
+
 if __name__ == "__main__":
     # Run tests if executed directly
     pytest.main([__file__, "-v"])

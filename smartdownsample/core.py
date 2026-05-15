@@ -17,6 +17,7 @@ from natsort import natsorted
 
 import torch
 import torchvision.transforms as T
+import torchvision.models as tvm
 from sklearn.cluster import AgglomerativeClustering
 
 warnings.filterwarnings('ignore')
@@ -24,7 +25,20 @@ warnings.filterwarnings('ignore')
 # --- Constants ---
 
 MODEL_NAME = 'dinov2_vits14'
-EMBEDDING_DIM = 384
+EMBEDDING_DIMS = {
+    'dinov2':         384,
+    'speciesnet':    1280,
+    'titok_backbone': 2048,
+    'titok_full':    4096,
+}
+
+_SPECIESNET_WEIGHTS_DEFAULT = '/data3/yijin.toh/sentinel/models/speciesnet/custom_pytorch/speciesnet_ported_weights_flat.pt'
+_TITOK_WEIGHTS_DEFAULT = (
+    '/home/yijin/sentinel/peter_workspace/TiTok-Distill-Prod/titok-distill-prod/'
+    'trained-models/6154_finetune_v3_fft_multiloss_ddp_fixed_v2_gan_v6/Models/'
+    '1MSELoss_0.01perceptualloss_0.1gradloss_0.01ssimloss_1fourierloss_0.0075ganloss_SSIM_best.pt'
+)
+
 INFERENCE_BATCH_SIZE = 64
 CHUNK_SIZE = 2000
 N_REP = 5
@@ -36,6 +50,56 @@ SEED = 42
 _model = None
 _device = None
 _transform = None
+_model_version = None   # cache key: 'dinov2' | 'speciesnet' | 'titok_backbone' | 'titok_full'
+_embedding_dim = None   # set when model loads; used for empty-array fallback
+
+
+class _GeminiV0Encoder(torch.nn.Module):
+    """
+    ResNet101-based image encoder used as the student model in a TiTok distillation
+    pipeline (TiTok-Distill-Prod by Peter Bermant, Conservation X Labs).
+
+    Naming note: "Gemini" is an artifact of Peter Bermant's internal project naming
+    scheme. This is a plain ResNet101 encoder with two projection heads.
+
+    Training limitation: this model was trained exclusively on bounding-box crops of
+    camera-trap detections, not full-frame images. Embedding quality on full frames
+    will be lower than DINOv2 or SpeciesNet. For best results, call sample_diverse()
+    with model_version='titok' on cropouts from crop_boxes.py in the model-building
+    pipeline (post-detection, pre-training) rather than on raw full-frame images.
+
+    Forward output shape: (B, 4096, 128)
+    Backbone-only output:  (B, 2048, 8, 8) for 256x256 inputs
+    """
+
+    def __init__(self):
+        super().__init__()
+        _bb = tvm.resnet101(weights=None)
+        self.backbone = torch.nn.Sequential(
+            _bb.conv1, _bb.bn1, _bb.relu, _bb.maxpool,
+            _bb.layer1, _bb.layer2, _bb.layer3, _bb.layer4,
+        )
+        self.channel_proj = torch.nn.Sequential(
+            torch.nn.Conv2d(2048, 4096, kernel_size=1),
+            torch.nn.BatchNorm2d(4096),
+            torch.nn.ReLU(),
+        )
+        self.sequence_proj = torch.nn.Sequential(
+            torch.nn.Linear(64, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(p=0.1),
+            torch.nn.Linear(256, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(p=0.1),
+            torch.nn.Linear(256, 128),
+        )
+
+    def forward(self, x):
+        x = self.backbone(x)             # (B, 2048, 8, 8)
+        x = self.channel_proj(x)         # (B, 4096, 8, 8)
+        x = x.view(x.size(0), 4096, -1) # (B, 4096, 64)
+        x = self.sequence_proj(x)        # (B, 4096, 128)
+        return x
 
 
 def _patch_dinov2_for_older_python():
@@ -65,11 +129,33 @@ def _patch_dinov2_for_older_python():
                     f.write(content)
 
 
-def _get_model():
-    """Load DINOv2 ViT-S/14 on first use, cache for subsequent calls."""
-    global _model, _device, _transform
-    if _model is None:
-        _device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def _pad_to_square(img):
+    """Pad a PIL image to square with black borders, preserving aspect ratio."""
+    w, h = img.size
+    if w == h:
+        return img
+    max_side = max(w, h)
+    pad_w_left = (max_side - w) // 2
+    pad_h_top = (max_side - h) // 2
+    pad_w_right = max_side - w - pad_w_left
+    pad_h_bottom = max_side - h - pad_h_top
+    from PIL import ImageOps
+    return ImageOps.expand(img, border=(pad_w_left, pad_h_top, pad_w_right, pad_h_bottom), fill=0)
+
+
+def _get_model(model_version='dinov2', titok_layer='backbone',
+               speciesnet_weights=None, titok_weights=None):
+    """Load the requested embedding model on first use; cache for subsequent calls."""
+    global _model, _device, _transform, _model_version, _embedding_dim
+
+    cache_key = model_version if model_version != 'titok' else f'titok_{titok_layer}'
+
+    if _model is not None and _model_version == cache_key:
+        return _model, _device, _transform, _embedding_dim
+
+    _device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if model_version == 'dinov2':
         try:
             _model = torch.hub.load('facebookresearch/dinov2', MODEL_NAME)
         except TypeError:
@@ -83,7 +169,52 @@ def _get_model():
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-    return _model, _device, _transform
+        _embedding_dim = EMBEDDING_DIMS['dinov2']
+
+    elif model_version == 'speciesnet':
+        import timm
+        weights_path = speciesnet_weights or _SPECIESNET_WEIGHTS_DEFAULT
+        if not os.path.isfile(weights_path):
+            raise ValueError(f"SpeciesNet weights not found at: {weights_path}")
+        enc = timm.create_model('tf_efficientnetv2_m', pretrained=False, num_classes=0)
+        state_dict = torch.load(weights_path, map_location=_device, weights_only=False)
+        backbone_sd = {k.replace('backbone.', ''): v
+                       for k, v in state_dict.items() if k.startswith('backbone.')}
+        enc.load_state_dict(backbone_sd)
+        _model = enc.to(_device).eval()
+        _transform = T.Compose([
+            T.Resize(480, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(480),
+            T.ToTensor(),
+            # No normalization: model forward internally applies x*255 then (x-128)/128
+        ])
+        _embedding_dim = EMBEDDING_DIMS['speciesnet']
+
+    elif model_version == 'titok':
+        weights_path = titok_weights or _TITOK_WEIGHTS_DEFAULT
+        if not os.path.isfile(weights_path):
+            raise ValueError(f"TiTok weights not found at: {weights_path}")
+        enc = _GeminiV0Encoder()
+        state_dict = torch.load(weights_path, map_location=_device, weights_only=False)
+        student_sd = {k.replace('student_model.', ''): v
+                      for k, v in state_dict.items() if k.startswith('student_model.')}
+        enc.load_state_dict(student_sd)
+        _model = enc.to(_device).eval()
+        _transform = T.Compose([
+            T.Lambda(lambda img: _pad_to_square(img)),
+            T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            # No normalization: matches Img2ImgDataset training preprocessing
+        ])
+        _embedding_dim = EMBEDDING_DIMS[f'titok_{titok_layer}']
+
+    else:
+        raise ValueError(
+            f"model_version must be one of 'dinov2', 'speciesnet', 'titok', got '{model_version}'"
+        )
+
+    _model_version = cache_key
+    return _model, _device, _transform, _embedding_dim
 
 
 # --- Helpers ---
@@ -149,26 +280,36 @@ def _load_image(path: str, transform, image_loading_errors: str):
         return str(path), None, error_msg
 
 
-def _compute_embeddings(image_paths, n_workers, show_progress, image_loading_errors):
+def _compute_embeddings(image_paths, n_workers, show_progress, image_loading_errors,
+                        model_version='dinov2', titok_layer='backbone',
+                        speciesnet_weights=None, titok_weights=None):
     """
-    Compute DINOv2 embeddings for a list of image paths.
+    Compute embeddings for a list of image paths using the selected model.
 
     Loads and infers in batches to keep memory usage constant regardless of
-    dataset size. Only the final embeddings (N x 384 floats = ~1.5KB per image)
-    are kept in memory, not the full image tensors (~600KB each).
+    dataset size. Only the final embeddings are kept in memory, not the full
+    image tensors (~600 KB each). Embedding memory per 100K images:
+      dinov2:         384 floats × 4 B = ~150 MB
+      speciesnet:    1280 floats × 4 B = ~500 MB
+      titok_backbone: 2048 floats × 4 B = ~800 MB
+      titok_full:    4096 floats × 4 B = ~1.6 GB
 
     Returns:
         valid_paths: List of paths that were successfully processed
-        embeddings: numpy array of shape (N, 384), L2-normalized
+        embeddings: numpy array of shape (N, D), L2-normalized
         failed_paths: List of (path, error_msg) tuples
     """
-    model, device, transform = _get_model()
+    model, device, transform, embedding_dim = _get_model(
+        model_version=model_version,
+        titok_layer=titok_layer,
+        speciesnet_weights=speciesnet_weights,
+        titok_weights=titok_weights,
+    )
 
     valid_paths = []
     failed_paths = []
     all_embeddings = []
 
-    # Process images in batches to avoid holding all tensors in memory
     n_total = len(image_paths)
     n_batches = (n_total + INFERENCE_BATCH_SIZE - 1) // INFERENCE_BATCH_SIZE
 
@@ -182,7 +323,6 @@ def _compute_embeddings(image_paths, n_workers, show_progress, image_loading_err
         end = min(start + INFERENCE_BATCH_SIZE, n_total)
         batch_paths = image_paths[start:end]
 
-        # Load images for this batch in parallel
         batch_tensors = []
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(_load_image, path, transform, image_loading_errors)
@@ -195,15 +335,21 @@ def _compute_embeddings(image_paths, n_workers, show_progress, image_loading_err
                 else:
                     failed_paths.append((path, error_msg))
 
-        # Run inference on this batch and discard tensors immediately
         if batch_tensors:
             with torch.no_grad():
                 batch = torch.stack(batch_tensors).to(device)
-                features = model(batch)
+                if model_version == 'titok' and titok_layer == 'backbone':
+                    features = model.backbone(batch)
+                    features = features.reshape(features.size(0), features.size(1), -1).mean(dim=-1)
+                elif model_version == 'titok' and titok_layer == 'full':
+                    features = model(batch).mean(dim=-1)
+                else:
+                    features = model(batch)
                 all_embeddings.append(features.cpu().numpy())
 
     if not all_embeddings:
-        return valid_paths, np.empty((0, EMBEDDING_DIM)), failed_paths
+        assert embedding_dim is not None
+        return valid_paths, np.empty((0, embedding_dim)), failed_paths
 
     embeddings = np.vstack(all_embeddings)
 
@@ -763,10 +909,14 @@ def sample_diverse(
     save_distribution: Optional[str] = None,
     save_thumbnails: Optional[str] = None,
     image_loading_errors: str = "raise",
-    return_indices: bool = False
+    return_indices: bool = False,
+    model_version: str = 'dinov2',
+    titok_layer: str = 'backbone',
+    speciesnet_weights: Optional[str] = None,
+    titok_weights: Optional[str] = None,
 ) -> Union[List[str], List[int]]:
     """
-    Diverse sampling from large image collections using DINOv2 embeddings.
+    Diverse sampling from large image collections using embedding-based clustering.
 
     Uses divide-and-conquer agglomerative clustering to group visually similar
     images, then samples to maximize diversity across clusters.
@@ -784,6 +934,13 @@ def sample_diverse(
         save_thumbnails: Path to save thumbnail grids as PNG (default: None)
         image_loading_errors: How to handle image loading errors - "raise" or "skip"
         return_indices: Return 0-based indices instead of paths
+        model_version: Embedding model to use - 'dinov2' (default), 'speciesnet', or 'titok'
+        titok_layer: Which layer to extract from titok model - 'backbone' (2048-dim,
+            default) or 'full' (4096-dim). Ignored for other model_version values.
+        speciesnet_weights: Path to SpeciesNet .pt weights file. Defaults to the
+            Conservation X Labs server path.
+        titok_weights: Path to TiTok DistillEncTiTokDec .pt weights file. Defaults to
+            the Conservation X Labs server path.
 
     Returns:
         List of exactly target_count selected image paths (if return_indices=False)
@@ -793,6 +950,14 @@ def sample_diverse(
     # Validate inputs
     if image_loading_errors not in ["raise", "skip"]:
         raise ValueError(f"image_loading_errors must be 'raise' or 'skip', got '{image_loading_errors}'")
+    if model_version not in ('dinov2', 'speciesnet', 'titok'):
+        raise ValueError(
+            f"model_version must be one of 'dinov2', 'speciesnet', 'titok', got '{model_version}'"
+        )
+    if titok_layer not in ('backbone', 'full'):
+        raise ValueError(
+            f"titok_layer must be 'backbone' or 'full', got '{titok_layer}'"
+        )
 
     save_distribution_path = _validate_png_path(save_distribution, "save_distribution")
     save_thumbnails_path = _validate_png_path(save_thumbnails, "save_thumbnails")
@@ -827,7 +992,11 @@ def sample_diverse(
 
     # Step 1: Compute embeddings
     valid_paths, embeddings, failed_paths = _compute_embeddings(
-        sorted_image_paths, n_workers, show_progress, image_loading_errors
+        sorted_image_paths, n_workers, show_progress, image_loading_errors,
+        model_version=model_version,
+        titok_layer=titok_layer,
+        speciesnet_weights=speciesnet_weights,
+        titok_weights=titok_weights,
     )
 
     # Report failed images

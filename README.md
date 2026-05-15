@@ -2,7 +2,7 @@
 
 **Embedding-based diverse downsampling for large image datasets**
 
-`smartdownsample` selects representative subsets from large image collections while preserving visual diversity. It uses DINOv2 embeddings and agglomerative clustering to group visually similar images, then samples across clusters to maximize variety.
+`smartdownsample` selects representative subsets from large image collections while preserving visual diversity. It uses image embeddings and agglomerative clustering to group visually similar images, then samples across clusters to maximize variety. Three embedding models are supported: DINOv2 (default, general-purpose), SpeciesNet (wildlife-tuned), and a TiTok distillation encoder (best on bounding-box crops).
 
 Built for image collections that:
 1. Contain more images than you need for training, and
@@ -27,9 +27,25 @@ Note: `pip install smartdownsample` installs CPU-only PyTorch. For GPU support, 
 ```python
 from smartdownsample import sample_diverse
 
+# Default: DINOv2 embeddings
 selected = sample_diverse(
     image_paths=my_image_list,
     target_count=50000
+)
+
+# SpeciesNet embeddings (wildlife-tuned)
+selected = sample_diverse(
+    image_paths=my_image_list,
+    target_count=50000,
+    model_version='speciesnet'
+)
+
+# TiTok encoder on bounding-box crops (post-detection)
+selected = sample_diverse(
+    image_paths=my_cropout_list,
+    target_count=50000,
+    model_version='titok',
+    titok_layer='backbone'   # 'backbone' (2048-dim) or 'full' (4096-dim)
 )
 ```
 
@@ -47,13 +63,33 @@ selected = sample_diverse(
 | `save_thumbnails` | `None` | Path to save thumbnail grids as PNG (creates directories if needed) |
 | `image_loading_errors` | `"raise"` | How to handle image loading errors: `"raise"` (fail immediately) or `"skip"` (continue with remaining images) |
 | `return_indices` | `False` | Return 0-based indices instead of paths (refers to original input list order) |
+| `model_version` | `"dinov2"` | Embedding model: `"dinov2"`, `"speciesnet"`, or `"titok"` |
+| `titok_layer` | `"backbone"` | For `model_version='titok'`: `"backbone"` (2048-dim) or `"full"` (4096-dim). Ignored for other models. |
+| `speciesnet_weights` | CXL server path | Path to SpeciesNet `.pt` weights file |
+| `titok_weights` | CXL server path | Path to TiTok DistillEncTiTokDec `.pt` weights file |
 
 ## How it works
 
 The algorithm has four steps:
 
 1. **Embedding extraction**
-   Each image is passed through DINOv2 ViT-S/14 to produce a 384-dimensional embedding vector that captures semantic visual features (subjects, backgrounds, composition, lighting). Embeddings are L2-normalized. The model is loaded once and cached for subsequent calls.
+
+   Each image is encoded into a fixed-length embedding vector that captures semantic visual features (subjects, backgrounds, composition, lighting). Embeddings are L2-normalized. The model is loaded once and cached for subsequent calls.
+
+   Three models are available:
+
+   | Model | Dim | Input | Notes |
+   |-------|-----|-------|-------|
+   | `dinov2` | 384 | 224×224 | ViT-S/14; general-purpose; good default for full-frame images |
+   | `speciesnet` | 1,280 | 480×480 | EfficientNetV2-M backbone from Google SpeciesNet; tuned for wildlife camera-trap images |
+   | `titok` (backbone) | 2,048 | 256×256 | ResNet101 student encoder; trained on **bounding-box crops** — use after detection, not on full frames |
+   | `titok` (full) | 4,096 | 256×256 | Same encoder, deeper projection; higher dimensionality, slower clustering |
+
+   Approximate memory for embeddings (float32, per 100K images):
+   - `dinov2`: ~150 MB
+   - `speciesnet`: ~500 MB
+   - `titok` backbone: ~800 MB
+   - `titok` full: ~1.6 GB
 
 2. **Clustering**
    Images are grouped using agglomerative clustering (cosine distance, average linkage) with a fixed distance threshold. The number of clusters reflects the natural visual structure of the data, not the selection budget. This means larger clusters (common visual patterns) get proportionally more images in the selection, while small clusters (rare/unique images) are still guaranteed representation.
@@ -86,7 +122,7 @@ The algorithm has four steps:
 
 ## Performance
 
-Approximate times on an NVIDIA RTX 3080 Ti.
+Approximate times on an NVIDIA RTX 3080 Ti (DINOv2).
 
 | Dataset size | Embedding time (GPU) | Clustering | Total |
 |-------------|---------------------|------------|-------|
@@ -94,6 +130,8 @@ Approximate times on an NVIDIA RTX 3080 Ti.
 | 10,000 images | ~15s | ~1s | ~20s |
 | 100,000 images | ~2.5 min | ~10s | ~3 min |
 | 1,000,000 images | ~25 min | ~2 min | ~30 min |
+
+SpeciesNet and TiTok process larger images (480×480 and 256×256 vs. 224×224) with heavier backbones, so embedding throughput will be lower; clustering time is the same.
 
 ## License
 
